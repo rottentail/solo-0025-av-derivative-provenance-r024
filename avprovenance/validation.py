@@ -121,3 +121,62 @@ def require_boolean(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise PlanInvalid(f"{name} must be boolean.")
     return value
+
+
+MAX_SEGMENT_FRAMES = 11_520_000
+MAX_SEGMENTS_PER_RUN = 4096
+EXECUTION_MODES = {"inline", "segmented"}
+
+
+def _execution_integer(value: Any, name: str, *, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationFailure(f"execution.{name} must be an integer.")
+    if value < 1 or value > maximum:
+        raise ValidationFailure(
+            f"execution.{name} is outside the allowed range.",
+            details={"minimum": 1, "maximum": maximum},
+        )
+    return value
+
+
+def validate_execution(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    request = require_object(value, "execution")
+    unknown = sorted(set(request) - {"mode", "segment_frames", "segments_per_run"})
+    if unknown:
+        raise ValidationFailure(
+            "execution contains unsupported fields.",
+            details={"fields": unknown},
+        )
+    mode = request.get("mode", "inline")
+    if not isinstance(mode, str) or mode not in EXECUTION_MODES:
+        raise ValidationFailure(
+            "execution.mode must be one of: inline, segmented."
+        )
+    segment_frames = request.get("segment_frames")
+    segments_per_run = request.get("segments_per_run")
+    if mode == "inline":
+        if segment_frames is not None or segments_per_run is not None:
+            raise ValidationFailure(
+                "execution tuning requires segmented mode."
+            )
+        return {"mode": "inline"}
+    parsed: dict[str, Any] = {"mode": "segmented"}
+    if segment_frames is not None:
+        parsed["segment_frames"] = _execution_integer(
+            segment_frames,
+            "segment_frames",
+            maximum=MAX_SEGMENT_FRAMES,
+        )
+    else:
+        parsed["segment_frames"] = None
+    if segments_per_run is not None:
+        parsed["segments_per_run"] = _execution_integer(
+            segments_per_run,
+            "segments_per_run",
+            maximum=MAX_SEGMENTS_PER_RUN,
+        )
+    else:
+        parsed["segments_per_run"] = 1
+    return parsed

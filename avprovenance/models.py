@@ -146,7 +146,8 @@ class Rendition:
     def transition_to(self, target: str) -> None:
         allowed = {
             "queued": {"running"},
-            "running": {"completed", "failed"},
+            "running": {"completed", "failed", "paused"},
+            "paused": {"running"},
             "completed": set(),
             "failed": set(),
         }

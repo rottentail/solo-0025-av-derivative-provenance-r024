@@ -82,6 +82,16 @@ class RenditionNotCompleted(ApplicationError):
         )
 
 
+class RenditionNotPaused(ApplicationError):
+    def __init__(self, rendition_id: str, status: str) -> None:
+        super().__init__(
+            code="RENDITION_NOT_PAUSED",
+            message="Only a paused segmented rendition can be resumed.",
+            status=409,
+            details={"rendition_id": rendition_id, "status": status},
+        )
+
+
 class PlanInvalid(ApplicationError):
     def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(

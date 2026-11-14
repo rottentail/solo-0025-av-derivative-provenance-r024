@@ -140,22 +140,28 @@ class HTTPClient:
 
 
 @contextmanager
+def server_on(data_dir: Path) -> Iterator[tuple[HTTPClient, ProvenanceHTTPServer]]:
+    server = build_http_server("127.0.0.1", 0, data_dir)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.02},
+        daemon=True,
+    )
+    thread.start()
+    host, port = server.server_address[:2]
+    try:
+        yield HTTPClient(str(host), int(port)), server
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@contextmanager
 def running_server() -> Iterator[tuple[HTTPClient, ProvenanceHTTPServer]]:
     with tempfile.TemporaryDirectory(prefix="avprovenance-check-") as temporary:
-        server = build_http_server("127.0.0.1", 0, Path(temporary))
-        thread = threading.Thread(
-            target=server.serve_forever,
-            kwargs={"poll_interval": 0.02},
-            daemon=True,
-        )
-        thread.start()
-        host, port = server.server_address[:2]
-        try:
-            yield HTTPClient(str(host), int(port)), server
-        finally:
-            server.shutdown()
-            thread.join(timeout=5)
-            server.server_close()
+        with server_on(Path(temporary)) as pair:
+            yield pair
 
 
 def require_equal(actual: Any, expected: Any, label: str) -> None:
@@ -393,6 +399,305 @@ def run_verify_reproduction(
     }
 
 
+def resume_until_done(
+    client: HTTPClient,
+    rendition_id: str,
+    *,
+    limit: int = 500,
+) -> tuple[dict[str, Any], int]:
+    resumes = 0
+    while True:
+        status, body = client.request(
+            "POST",
+            f"/v1/renditions/{rendition_id}/resume",
+            {},
+        )
+        require_equal(status, 200, "resume status")
+        resumes += 1
+        require(resumes <= limit, "segmented rendition did not finish")
+        if body["status"] != "paused":
+            return body, resumes
+
+
+def run_segmented_rendition_resume() -> dict[str, Any]:
+    audio_plan = [
+        {"type": "media_trim", "start_seconds": 0.05, "duration_seconds": 1.0},
+        {"type": "audio_gain", "db": -3},
+        {
+            "type": "audio_mix",
+            "secondary_gain": -6,
+            "primary_weight": 0.75,
+            "secondary_weight": 0.4,
+        },
+        {"type": "audio_normalize", "target_peak": 0.8},
+    ]
+    video_plan = [
+        {"type": "media_trim", "start_frame": 1, "frame_count": 7},
+        {"type": "video_crop", "x": 8, "y": 6, "width": 32, "height": 18},
+        {"type": "video_luma_offset", "amount": 12},
+        {"type": "video_mirror"},
+    ]
+    with tempfile.TemporaryDirectory(prefix="avprovenance-check-") as temporary:
+        data_dir = Path(temporary)
+        with server_on(data_dir) as (client, server):
+            primary = client.upload(
+                "long-primary.wav",
+                make_wav(frequency=440, duration_seconds=1.1, amplitude=10000),
+            )
+            secondary = client.upload(
+                "long-secondary.wav",
+                make_wav(frequency=220, duration_seconds=1.4, amplitude=7000),
+            )
+
+            create_status, segmented = client.request(
+                "POST",
+                "/v1/renditions",
+                {
+                    "primary_asset_id": primary["id"],
+                    "secondary_asset_id": secondary["id"],
+                    "output_name": "segmented-mix.wav",
+                    "operations": audio_plan,
+                    "execution": {
+                        "mode": "segmented",
+                        "segment_frames": 2000,
+                        "segments_per_run": 2,
+                    },
+                },
+            )
+            require_equal(create_status, 201, "segmented create status")
+            require_equal(segmented["status"], "paused", "segmented create pauses")
+            require(segmented["output_asset"] is None, "paused rendition exposed an output")
+            progress = segmented["render_progress"]
+            require_equal(progress["mode"], "segmented", "progress mode")
+            require(progress["segments_completed"] > 0, "no segments were checkpointed")
+            segmented_id = segmented["id"]
+
+            _, paused_lineage = client.request(
+                "GET",
+                f"/v1/renditions/{segmented_id}/lineage",
+            )
+            require_equal(paused_lineage["status"], "paused", "paused lineage status")
+            require(paused_lineage["output"] is None, "paused lineage exposed an output")
+            require(paused_lineage["edge"] is None, "paused lineage exposed an edge")
+            require_equal(paused_lineage["parents"], [], "paused lineage parents")
+
+            early_status, early_check = client.request(
+                "POST",
+                f"/v1/renditions/{segmented_id}/integrity-checks",
+                {},
+            )
+            require_equal(early_status, 409, "paused integrity status")
+            require_equal(
+                early_check["error"]["code"],
+                "RENDITION_NOT_COMPLETED",
+                "paused integrity code",
+            )
+
+            inline = client.create_rendition(
+                {
+                    "primary_asset_id": primary["id"],
+                    "secondary_asset_id": secondary["id"],
+                    "output_name": "inline-mix.wav",
+                    "operations": audio_plan,
+                }
+            )
+            require_equal(inline["status"], "completed", "inline rendition status")
+            require(inline["render_progress"] is None, "inline rendition had a session")
+            require_equal(
+                inline["plan_digest"],
+                segmented["plan_digest"],
+                "execution mode changed the plan digest",
+            )
+            inline_digest = inline["output_asset"]["sha256"]
+
+            segmented, audio_resumes = resume_until_done(client, segmented_id)
+            require_equal(segmented["status"], "completed", "resumed audio status")
+            require(
+                segmented["output_asset"]["sha256"] == inline_digest,
+                "resumed audio bytes differ from a single-run render",
+            )
+            history = [item["to"] for item in segmented["transitions"]]
+            require("paused" in history, "segmented history missed the pause")
+            require_equal(history[-1], "completed", "segmented history terminal state")
+
+            _, lineage = client.request(
+                "GET",
+                f"/v1/renditions/{segmented_id}/lineage",
+            )
+            require_equal(lineage["status"], "completed", "completed lineage status")
+            require_equal(len(lineage["parents"]), 2, "completed lineage parents")
+            require_equal(
+                lineage["output"]["sha256"],
+                inline_digest,
+                "completed lineage output digest",
+            )
+
+            check_status, check = client.request(
+                "POST",
+                f"/v1/renditions/{segmented_id}/integrity-checks",
+                {},
+            )
+            require_equal(check_status, 201, "segmented integrity status")
+            require_equal(check["status"], "verified", "segmented integrity result")
+            require_equal(
+                check["reproduced_digest"],
+                inline_digest,
+                "integrity replay digest",
+            )
+
+            again_status, again = client.request(
+                "POST",
+                f"/v1/renditions/{segmented_id}/resume",
+                {},
+            )
+            require_equal(again_status, 409, "completed resume status")
+            require_equal(
+                again["error"]["code"],
+                "RENDITION_NOT_PAUSED",
+                "completed resume code",
+            )
+
+            video = client.upload("long-frames.y4m", make_y4m(frame_count=9))
+            _, video_segmented = client.request(
+                "POST",
+                "/v1/renditions",
+                {
+                    "primary_asset_id": video["id"],
+                    "output_name": "segmented-video.y4m",
+                    "operations": video_plan,
+                    "execution": {
+                        "mode": "segmented",
+                        "segment_frames": 2,
+                        "segments_per_run": 1,
+                    },
+                },
+            )
+            require_equal(
+                video_segmented["status"],
+                "paused",
+                "segmented video create pauses",
+            )
+            video_inline = client.create_rendition(
+                {
+                    "primary_asset_id": video["id"],
+                    "output_name": "inline-video.y4m",
+                    "operations": video_plan,
+                }
+            )
+            video_segmented, video_resumes = resume_until_done(
+                client,
+                video_segmented["id"],
+            )
+            require_equal(
+                video_segmented["status"],
+                "completed",
+                "resumed video status",
+            )
+            require_equal(
+                video_segmented["output_asset"]["sha256"],
+                video_inline["output_asset"]["sha256"],
+                "resumed video bytes differ from a single-run render",
+            )
+            vcheck_status, vcheck = client.request(
+                "POST",
+                f"/v1/renditions/{video_segmented['id']}/integrity-checks",
+                {},
+            )
+            require_equal(vcheck_status, 201, "video integrity status")
+            require_equal(vcheck["status"], "verified", "video integrity result")
+
+            crash_status, crash = client.request(
+                "POST",
+                "/v1/renditions",
+                {
+                    "primary_asset_id": primary["id"],
+                    "secondary_asset_id": secondary["id"],
+                    "output_name": "interrupted-mix.wav",
+                    "operations": audio_plan,
+                    "execution": {
+                        "mode": "segmented",
+                        "segment_frames": 2000,
+                        "segments_per_run": 1,
+                    },
+                },
+            )
+            require_equal(crash_status, 201, "interrupted create status")
+            require_equal(crash["status"], "paused", "interrupted create pauses")
+            crash_id = crash["id"]
+
+            def simulate_process_kill(state: dict[str, Any]) -> None:
+                state["renditions"][crash_id]["status"] = "running"
+
+            server.application.state_file.mutate(simulate_process_kill)
+
+        with server_on(data_dir) as (client, server):
+            get_status, fetched = client.request(
+                "GET",
+                f"/v1/renditions/{crash_id}",
+            )
+            require_equal(get_status, 200, "restarted rendition status")
+            require_equal(
+                fetched["status"],
+                "paused",
+                "interrupted rendition was not reconciled to paused",
+            )
+            require(
+                fetched["render_progress"] is not None,
+                "restarted rendition lost its render session",
+            )
+
+            crashed, crash_resumes = resume_until_done(client, crash_id)
+            require_equal(crashed["status"], "completed", "crash-resumed status")
+            require_equal(
+                crashed["output_asset"]["sha256"],
+                inline_digest,
+                "crash-resumed bytes differ from a single-run render",
+            )
+            crash_check_status, crash_check = client.request(
+                "POST",
+                f"/v1/renditions/{crash_id}/integrity-checks",
+                {},
+            )
+            require_equal(crash_check_status, 201, "crash integrity status")
+            require_equal(
+                crash_check["status"],
+                "verified",
+                "crash integrity result",
+            )
+
+            state = server.application.state_file.read()
+            require_equal(
+                state["render_sessions"],
+                {},
+                "render sessions were not cleaned up",
+            )
+            asset_digests = {
+                str(asset["content_key"]).split("/")[-1]
+                for asset in state["assets"].values()
+            }
+            blob_digests = {
+                path.name
+                for path in (data_dir / "content").rglob("*")
+                if path.is_file()
+            }
+            require_equal(
+                blob_digests,
+                asset_digests,
+                "segment checkpoints leaked into content storage",
+            )
+            return {
+                "workflow": "segmented-rendition-resume",
+                "audio_rendition_id": segmented_id,
+                "video_rendition_id": video_segmented["id"],
+                "crash_rendition_id": crash_id,
+                "audio_resumes": audio_resumes,
+                "video_resumes": video_resumes,
+                "crash_resumes": crash_resumes,
+                "digest": inline_digest,
+                "integrity": crash_check["status"],
+            }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -401,17 +706,21 @@ def main() -> int:
             "ingest-media-asset",
             "execute-rendition",
             "verify-reproduction",
+            "segmented-rendition-resume",
         ),
     )
     args = parser.parse_args()
 
-    with running_server() as (client, server):
-        if args.workflow == "ingest-media-asset":
-            result = run_ingest_media_asset(client)
-        elif args.workflow == "execute-rendition":
-            result = run_execute_rendition(client)
-        else:
-            result = run_verify_reproduction(client, server)
+    if args.workflow == "segmented-rendition-resume":
+        result = run_segmented_rendition_resume()
+    else:
+        with running_server() as (client, server):
+            if args.workflow == "ingest-media-asset":
+                result = run_ingest_media_asset(client)
+            elif args.workflow == "execute-rendition":
+                result = run_execute_rendition(client)
+            else:
+                result = run_verify_reproduction(client, server)
     print(json.dumps(result, sort_keys=True))
     return 0
 

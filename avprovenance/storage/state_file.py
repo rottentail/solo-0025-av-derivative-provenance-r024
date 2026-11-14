@@ -21,6 +21,7 @@ DEFAULT_STATE: dict[str, Any] = {
     "renditions": {},
     "provenance_edges": [],
     "integrity_checks": {},
+    "render_sessions": {},
 }
 
 

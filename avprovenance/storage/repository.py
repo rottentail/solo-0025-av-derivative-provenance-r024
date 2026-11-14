@@ -84,6 +84,7 @@ class ProvenanceRepository:
             rendition.error_message = error_message
             rendition.transition_to("failed")
             state["renditions"][rendition_id] = rendition.to_dict()
+            state["render_sessions"].pop(rendition_id, None)
             return rendition
 
         return self.state_file.mutate(mutate)
@@ -108,6 +109,7 @@ class ProvenanceRepository:
             rendition.error_message = None
             rendition.transition_to("completed")
             state["renditions"][rendition_id] = rendition.to_dict()
+            state["render_sessions"].pop(rendition_id, None)
             return rendition
 
         return self.state_file.mutate(mutate)
@@ -185,3 +187,52 @@ class ProvenanceRepository:
         if not isinstance(raw, dict):
             raise RenditionNotFound(check_id)
         return IntegrityAudit.from_dict(deep_copy(raw))
+
+    def save_render_session(self, session: dict[str, Any]) -> None:
+        rendition_id = str(session["rendition_id"])
+
+        def mutate(state: dict[str, Any]) -> None:
+            if rendition_id not in state["renditions"]:
+                raise RenditionNotFound(rendition_id)
+            state["render_sessions"][rendition_id] = deep_copy(session)
+            return None
+
+        self.state_file.mutate(mutate)
+
+    def get_render_session(self, rendition_id: str) -> dict[str, Any] | None:
+        state = self.state_file.read()
+        raw = state["render_sessions"].get(rendition_id)
+        if not isinstance(raw, dict):
+            return None
+        return deep_copy(raw)
+
+    def list_render_sessions(self) -> list[dict[str, Any]]:
+        state = self.state_file.read()
+        return [
+            deep_copy(raw)
+            for raw in state["render_sessions"].values()
+            if isinstance(raw, dict)
+        ]
+
+    def asset_content_keys(self) -> set[str]:
+        state = self.state_file.read()
+        return {
+            str(raw["content_key"])
+            for raw in state["assets"].values()
+            if isinstance(raw, dict) and raw.get("content_key")
+        }
+
+    def pause_interrupted_segmented_renditions(self) -> int:
+        def mutate(state: dict[str, Any]) -> int:
+            paused = 0
+            for rendition_id in state["render_sessions"]:
+                raw = state["renditions"].get(rendition_id)
+                if not isinstance(raw, dict) or raw.get("status") != "running":
+                    continue
+                rendition = Rendition.from_dict(deep_copy(raw))
+                rendition.transition_to("paused")
+                state["renditions"][rendition_id] = rendition.to_dict()
+                paused += 1
+            return paused
+
+        return self.state_file.mutate(mutate)

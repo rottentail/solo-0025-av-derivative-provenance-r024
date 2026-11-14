@@ -16,6 +16,8 @@ FFmpeg, network access, credentials, or an online database.
 - Applies video trim, even-aligned crop, luma offset, and horizontal mirror.
 - Persists immutable assets, rendition state, provenance edges, and integrity
   checks.
+- Renders long media in checkpointed segments that can pause and resume
+  across process restarts, producing bytes identical to a single run.
 - Replays the stored operation plan and compares both bytes and media
   descriptors.
 
@@ -80,6 +82,36 @@ Content-Type: application/json
 Rendition creation is synchronous at the HTTP boundary. The durable transition
 history still records `queued`, `running`, and the terminal state.
 
+An optional `execution` block selects segmented rendering:
+
+```json
+{
+  "primary_asset_id": "asset_...",
+  "output_name": "long-derivative.wav",
+  "operations": [
+    {"type": "media_trim", "start_seconds": 12.0, "duration_seconds": 300.0},
+    {"type": "audio_normalize", "target_peak": 0.8}
+  ],
+  "execution": {
+    "mode": "segmented",
+    "segment_frames": 48000,
+    "segments_per_run": 4
+  }
+}
+```
+
+In segmented mode each invocation renders at most `segments_per_run`
+timeline segments (sample frames for audio, frames for video) and
+checkpoints them into a durable render session. When the budget is spent
+the rendition is `paused` and the response carries `render_progress`;
+unfinished segments never appear as assets or lineage. A process exit
+interrupting a segmented rendition is reconciled to `paused` at the next
+startup, so the derivation can always be continued. Segment size defaults
+to 48000 sample frames (audio) or 24 frames (video); `segments_per_run`
+defaults to 1. Segmented output is byte-identical to an inline render of
+the same plan — normalization uses one global peak across all segments, so
+segment boundaries leave no audible seams or duplicated frames.
+
 Audio-only operations:
 
 - `media_trim` with `start_seconds` and `duration_seconds`
@@ -93,6 +125,20 @@ Video-only operations:
 - `video_crop` with even `x`, `y`, `width`, and `height`
 - `video_luma_offset` with `amount`
 - `video_mirror`
+
+### Resume a paused rendition
+
+```http
+POST /v1/renditions/{rendition_id}/resume
+Content-Type: application/json
+
+{}
+```
+
+Returns `200` with the rendition representation: `paused` with updated
+`render_progress` while segments remain, or `completed` with the output
+asset once the final segment is assembled. Resuming anything other than a
+`paused` rendition returns `409 RENDITION_NOT_PAUSED`.
 
 ### Read rendition state
 
@@ -166,7 +212,10 @@ Video plan:
 ```
 
 `state.json` is replaced atomically. Binary objects are content-addressed by
-SHA-256 and written through temporary siblings before replacement.
+SHA-256 and written through temporary siblings before replacement. In-flight
+segmented renditions keep a `render_sessions` entry in `state.json` whose
+checkpointed segment blobs live in the same content store; both are discarded
+when the rendition reaches a terminal state.
 
 ## Source layout
 
@@ -196,10 +245,13 @@ current production workflow checks are:
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py segmented-rendition-resume
 ```
 
 Each check starts a temporary HTTP server, generates media bytes in memory,
-exercises the public endpoints, and shuts the server down.
+exercises the public endpoints, and shuts the server down. The segmented
+check additionally restarts the server on the same data directory to prove
+that an interrupted rendition resumes to bytes identical to a single run.
 
 ## Environment
 

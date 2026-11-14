@@ -20,6 +20,7 @@ LOGGER = logging.getLogger(__name__)
 ASSET_PATH = re.compile(r"^/v1/assets/([A-Za-z0-9_]+)$")
 RENDITION_PATH = re.compile(r"^/v1/renditions/([A-Za-z0-9_]+)$")
 LINEAGE_PATH = re.compile(r"^/v1/renditions/([A-Za-z0-9_]+)/lineage$")
+RESUME_PATH = re.compile(r"^/v1/renditions/([A-Za-z0-9_]+)/resume$")
 CHECK_PATH = re.compile(
     r"^/v1/renditions/([A-Za-z0-9_]+)/integrity-checks$"
 )
@@ -169,6 +170,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self,
                     201,
                     created,
+                    request_id=request_id,
+                )
+                return
+            resume_match = RESUME_PATH.match(path)
+            if resume_match:
+                read_json_body(self, required=False)
+                result = self.application.resume_rendition(resume_match.group(1))
+                write_json(
+                    self,
+                    200,
+                    result,
                     request_id=request_id,
                 )
                 return

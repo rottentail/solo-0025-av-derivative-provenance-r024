@@ -53,16 +53,14 @@ def gain_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
     )
 
 
-def normalize_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
-    peak = max(
+def audio_peak(clip: AudioClip) -> int:
+    return max(
         (abs(value) for channel in clip.channels for value in channel),
         default=0,
     )
-    if peak == 0:
-        return clip
-    target = float(operation["target_peak"])
-    desired = max(1.0, target * PCM_MAX)
-    factor = desired / peak
+
+
+def scale_audio(clip: AudioClip, factor: float) -> AudioClip:
     return replace_channels(
         clip,
         (
@@ -70,6 +68,16 @@ def normalize_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
             for values in clip.channels
         ),
     )
+
+
+def normalize_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
+    peak = audio_peak(clip)
+    if peak == 0:
+        return clip
+    target = float(operation["target_peak"])
+    desired = max(1.0, target * PCM_MAX)
+    factor = desired / peak
+    return scale_audio(clip, factor)
 
 
 def mix_audio(

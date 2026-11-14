@@ -58,6 +58,12 @@ Fields include the primary and secondary asset identifiers, normalized
 operations, plan digest, lifecycle status, transition history, output asset
 identifier, failure detail, and timestamps.
 
+A rendition may run inline (the default) or in segmented mode. Segmented
+renditions keep a durable render session with checkpointed segment progress
+so an interrupted process can resume the derivation later. The render
+session is runtime state, not a product: it never appears in asset or
+lineage reads and is discarded when the rendition reaches a terminal state.
+
 ### Provenance edge
 
 An immutable record linking a completed rendition to its parent asset
@@ -83,7 +89,8 @@ digest, result, reason, and check time.
 
 ```text
 queued -> running -> completed
-                  \-> failed
+        |         \-> failed
+        \-> paused -> running
 ```
 
 Rules:
@@ -94,6 +101,14 @@ Rules:
   `completed`.
 - Failure records a stable error code and does not create a provenance edge.
 - Terminal states cannot transition again.
+- Segmented renditions transition to `paused` when the current invocation
+  exhausts its segment budget; `paused` renditions hold a durable render
+  session and can transition back to `running` through a resume request.
+- A segmented rendition found in `running` when the application starts was
+  interrupted by a process exit and is reconciled to `paused` before the
+  server accepts requests.
+- `paused` is not terminal: it exposes no output asset, no provenance edge,
+  and no integrity checks.
 
 ### Integrity check lifecycle
 
@@ -141,19 +156,25 @@ Entry point: `POST /v1/renditions`
 
 Steps:
 
-1. The HTTP boundary reads the plan and output filename.
+1. The HTTP boundary reads the plan, output filename, and optional
+   `execution` block.
 2. The plan compiler checks the primary media kind, secondary usage, and
    operation-specific parameters.
 3. The repository persists a `queued` rendition.
 4. The application records `running` and reads parent media bytes.
-5. The executor applies audio or video operations in sequence.
+5. The executor applies audio or video operations in sequence. In segmented
+   mode the engine instead renders a bounded number of timeline segments,
+   checkpointing each segment as a content-addressed blob inside a durable
+   render session.
 6. The result is inspected, hashed, and saved as a new derivative asset.
 7. The repository appends a provenance edge.
 8. The rendition transitions to `completed`.
 
 Success:
 
-- Returns `201` with a completed rendition representation.
+- Returns `201` with a completed rendition representation, or — in
+  segmented mode with a segment budget smaller than the remaining work — a
+  `paused` rendition representation carrying `render_progress`.
 - The representation includes transition history, normalized operations,
   plan digest, and output asset identifier.
 
@@ -164,7 +185,35 @@ Failure:
 - Processing failure records `failed` with `RENDER_FAILED` and returns a stable
   error body. No completed output edge is emitted.
 
-### 3. Verify reproduction
+### 3. Resume segmented rendition
+
+Entry point: `POST /v1/renditions/{rendition_id}/resume`
+
+Steps:
+
+1. The application loads a `paused` rendition and its render session.
+2. The rendition transitions back to `running`.
+3. The segmented engine replays no completed segments: it verifies each
+   checkpoint digest it reads and continues from the recorded cursor.
+4. When the final stage completes, the engine assembles the checkpointed
+   segments into output bytes identical to a single uninterrupted run, and
+   the rendition completes exactly like an inline execution (output asset,
+   provenance edge, `completed`).
+5. Otherwise the rendition returns to `paused` with updated
+   `render_progress`.
+
+Success:
+
+- Returns `200` with the current rendition representation (`paused` or
+  `completed`).
+
+Failure:
+
+- A rendition that is not `paused` returns `409 RENDITION_NOT_PAUSED`.
+- A missing or corrupt checkpoint fails the rendition with `RENDER_FAILED`;
+  the render session and its segment blobs are discarded.
+
+### 4. Verify reproduction
 
 Entry point: `POST /v1/renditions/{rendition_id}/integrity-checks`
 
@@ -239,6 +288,7 @@ outcomes without knowing HTTP details.
 - `GET /v1/assets/{asset_id}`
 - `POST /v1/renditions`
 - `GET /v1/renditions/{rendition_id}`
+- `POST /v1/renditions/{rendition_id}/resume`
 - `GET /v1/renditions/{rendition_id}/lineage`
 - `POST /v1/renditions/{rendition_id}/integrity-checks`
 
@@ -255,6 +305,28 @@ leaking local paths.
 - Blob paths are generated internally and cannot contain traversal segments.
 - The HTTP server uses a threading server, while repository mutations remain
   serialized at the state boundary.
+- Render sessions live under `render_sessions` in the state file and are
+  persisted after every rendered segment. Segment bytes are
+  content-addressed blobs like any other media, but they are referenced
+  only from the session — never from asset records — and are removed once
+  the rendition completes or fails, unless another live record references
+  the same content.
+
+## Segmented rendering determinism
+
+Segmented execution splits the source timeline into fixed-size sample-frame
+or frame segments and applies the normalized plan stage by stage:
+
+- Per-sample operations (`audio_gain`, `audio_mix`) and per-frame
+  operations (`video_crop`, `video_luma_offset`, `video_mirror`) compute
+  exactly the same values as the whole-clip renderer for every index.
+- `media_trim` re-slices the same deterministic frame range and re-chunks
+  it into segments.
+- `audio_normalize` runs a whole-input peak analysis before any output
+  segment is produced, so every segment shares one gain factor and segment
+  boundaries stay inaudible.
+- Assembled output bytes equal the inline renderer byte for byte, so the
+  standard integrity check reproduces a segmented rendition unchanged.
 
 ## Validation plan
 
@@ -267,6 +339,7 @@ python3 -m compileall -q avprovenance scripts
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py segmented-rendition-resume
 ```
 
 The checks start an ephemeral HTTP server, generate bounded media bytes in
